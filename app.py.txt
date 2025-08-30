@@ -1,0 +1,66 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+st.set_page_config(page_title="Modelo DuPont", layout="wide")
+
+st.title("Modelo DuPont - Análisis de Rentabilidad")
+
+# Carga de archivo
+archivo = st.file_uploader("Carga tu archivo Excel o CSV", type=["xlsx", "xls", "csv"])
+
+if archivo:
+    if archivo.name.endswith(".csv"):
+        df = pd.read_csv(archivo, index_col=0)
+    else:
+        df = pd.read_excel(archivo, index_col=0)
+
+    st.subheader("Base de datos cargada")
+    st.dataframe(df)
+
+    # Cálculos del modelo DuPont
+    try:
+        resultados = pd.DataFrame()
+
+        resultados.loc["Margen Neto (%)"] = (df.loc["Utilidad Neta"] / df.loc["Ventas Netas"]) * 100
+        resultados.loc["Rotación (veces)"] = df.loc["Ventas Netas"] / df.loc["Activos Totales"]
+        resultados.loc["Apalancamiento (veces)"] = df.loc["Activos Totales"] / df.loc["Capital Contable"]
+
+        resultados.loc["ROE (%)"] = resultados.loc["Margen Neto (%)"] * resultados.loc["Rotación (veces)"]
+        resultados.loc["ROA (%)"] = resultados.loc["Rotación (veces)"] * resultados.loc["Apalancamiento (veces)"]
+
+        resultados.loc["Pay Back Capital (veces)"] = 1 / resultados.loc["ROE (%)"]
+        resultados.loc["Pay Back Activos (veces)"] = 1 / resultados.loc["ROA (%)"]
+
+        # Formatear: una decimal para todos
+        for index in resultados.index:
+            if "%" in index:
+                resultados.loc[index] = resultados.loc[index].apply(lambda x: round(x, 1))
+            else:
+                resultados.loc[index] = resultados.loc[index].apply(lambda x: round(x, 1))
+
+        st.subheader("Reporte Modelo DuPont")
+        st.dataframe(resultados)
+
+        # Descargar Excel
+        def convertir_a_excel(df):
+            from io import BytesIO
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Reporte')
+            return output.getvalue()
+
+        st.download_button(
+            label="📥 Descargar reporte en Excel",
+            data=convertir_a_excel(resultados),
+            file_name="reporte_dupont.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except KeyError as e:
+        st.error(f"Falta un dato requerido en la base: {e}")
+        st.info("Asegúrate de que el archivo contenga las siguientes filas:\n"
+                "- Ventas Netas\n- Utilidad Neta\n- Activos Totales\n- Capital Contable")
+
+else:
+    st.info("Por favor, carga un archivo con los datos requeridos.")
