@@ -1,0 +1,287 @@
+# app.py — Modelo DuPont en Streamlit (listo para GitHub)
+# Requisitos (requirements.txt):
+# streamlit
+# pandas
+# numpy
+# openpyxl
+# xlsxwriter
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from io import BytesIO
+
+st.set_page_config(page_title="Modelo DuPont — Rentabilidad", layout="wide")
+st.title("Modelo DuPont — Rentabilidad por Períodos")
+st.caption(
+    "Este módulo calcula métricas tipo DuPont a partir de una base de datos subida por el usuario.\n"
+    "Formulación usada (según lo solicitado): ROE = Margen × Rotación; ROA = Rotación × Apalancamiento.\n"
+    "Los resultados de Margen, ROE y ROA se reportan en valores relativos (\u0025) con 1 decimal;\n"
+    "Rotación, Apalancamiento y Paybacks en valores absolutos con 1 decimal."
+)
+
+# -------------------------------
+# Utilidades
+# -------------------------------
+
+def _normalize_cols(cols):
+    return [str(c).strip() for c in cols]
+
+CANDIDATES = {
+    "period": ["periodo", "period", "fecha", "año", "anio", "mes", "trimestre", "year"],
+    "ventas": ["ventas netas", "ventas", "ingresos", "sales", "net sales"],
+    "utilidad": ["utilidad neta", "ganancia neta", "net income", "profit"],
+    "activos": ["activos totales", "activos", "total assets", "assets"],
+    "capital": ["capital contable", "patrimonio", "equity", "capital"]
+}
+
+
+def _guess_index(cols, role):
+    cols_norm = [c.lower().strip() for c in cols]
+    for cand in CANDIDATES[role]:
+        if cand in cols_norm:
+            return cols_norm.index(cand)
+    # fallback sensible
+    if role == "period":
+        return 0
+    # para métricas numéricas, intenta por nombre parcial
+    for i, c in enumerate(cols_norm):
+        if role in ("ventas", "utilidad") and ("venta" in c or "ingreso" in c or "sales" in c):
+            return i
+        if role == "activos" and ("activo" in c or "asset" in c):
+            return i
+        if role == "capital" and ("capital" in c or "equity" in c or "patrimon" in c):
+            return i
+    return min(1, len(cols_norm) - 1)  # cualquier otra numérica
+
+
+def _read_any(file):
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(file)
+    return pd.read_excel(file)
+
+
+def _last_non_null(s: pd.Series):
+    s2 = s.dropna()
+    return s2.iloc[-1] if not s2.empty else np.nan
+
+
+def _sort_period_index(idx: pd.Index) -> pd.Index:
+    # intenta ordenar por fecha, luego numérico, luego alfabético
+    try:
+        dt = pd.to_datetime(idx, errors="raise")
+        return pd.Index(idx[np.argsort(dt)])
+    except Exception:
+        try:
+            num = pd.to_numeric(idx, errors="raise")
+            return pd.Index(idx[np.argsort(num)])
+        except Exception:
+            return pd.Index(sorted(idx.astype(str)))
+
+
+def _template_csv_bytes():
+    df = pd.DataFrame({
+        "Periodo": ["2024Q1", "2024Q2", "2024Q3"],
+        "Ventas Netas": [1000_000, 1_200_000, 1_350_000],
+        "Utilidad Neta": [90_000, 110_000, 125_000],
+        "Activos Totales": [2_500_000, 2_650_000, 2_800_000],
+        "Capital Contable": [1_200_000, 1_250_000, 1_300_000],
+    })
+    return df.to_csv(index=False).encode("utf-8")
+
+
+# -------------------------------
+# Sidebar — entrada y opciones
+# -------------------------------
+with st.sidebar:
+    st.header("1) Cargar base de datos")
+    file = st.file_uploader("Sube un CSV o Excel", type=["csv", "xlsx", "xls"])    
+    st.download_button(
+        "Descargar plantilla CSV",
+        data=_template_csv_bytes(),
+        file_name="plantilla_dupont.csv",
+        mime="text/csv",
+        help="Plantilla sugerida con columnas mínimas necesarias"
+    )
+
+    st.header("2) Opciones de agregación")
+    agg_label = st.selectbox(
+        "Si hay múltiples filas por período, ¿cómo agregamos Activos/Capital?",
+        ["Último valor", "Promedio", "Suma"],
+        index=0,
+        help=(
+            "Ventas Netas y Utilidad Neta siempre se suman por período.\n"
+            "Para Activos y Capital puedes elegir el último valor (cierre), el promedio o la suma."
+        ),
+    )
+    AGG_MAP = {"Último valor": _last_non_null, "Promedio": "mean", "Suma": "sum"}
+
+# -------------------------------
+# Flujo principal
+# -------------------------------
+if file is None:
+    st.info(
+        "Sube tu archivo en la barra lateral o descarga la plantilla para comenzar.")
+    st.stop()
+
+raw = _read_any(file)
+raw.columns = _normalize_cols(raw.columns)
+
+st.subheader("Vista previa de la base de datos")
+st.dataframe(raw.head(50), use_container_width=True)
+
+st.subheader("Mapeo de columnas")
+cols = list(raw.columns)
+col1, col2 = st.columns(2)
+with col1:
+    period_col = st.selectbox("Columna de período", options=cols, index=_guess_index(cols, "period"))
+    ventas_col = st.selectbox("Columna de Ventas Netas", options=cols, index=_guess_index(cols, "ventas"))
+    utilidad_col = st.selectbox("Columna de Utilidad Neta", options=cols, index=_guess_index(cols, "utilidad"))
+with col2:
+    activos_col = st.selectbox("Columna de Activos Totales", options=cols, index=_guess_index(cols, "activos"))
+    capital_col = st.selectbox("Columna de Capital Contable", options=cols, index=_guess_index(cols, "capital"))
+
+# Cast numéricos
+for c in [ventas_col, utilidad_col, activos_col, capital_col]:
+    raw[c] = pd.to_numeric(raw[c], errors="coerce")
+
+# Agrupar por período
+agg_func = AGG_MAP[agg_label]
+if isinstance(agg_func, str):
+    grouped = raw.groupby(period_col, dropna=False).agg({
+        ventas_col: "sum",
+        utilidad_col: "sum",
+        activos_col: agg_func,
+        capital_col: agg_func,
+    })
+else:
+    grouped = raw.groupby(period_col, dropna=False).agg({
+        ventas_col: "sum",
+        utilidad_col: "sum",
+        activos_col: agg_func,
+        capital_col: agg_func,
+    })
+
+# Renombrar a nombres estándar
+grouped = grouped.rename(columns={
+    ventas_col: "Ventas Netas",
+    utilidad_col: "Utilidad Neta",
+    activos_col: "Activos Totales",
+    capital_col: "Capital Contable",
+})
+
+# Ordenar períodos de manera inteligente
+sorted_idx = _sort_period_index(grouped.index)
+# Asegurar reindexado en el orden calculado
+# Nota: sorted_idx puede ser un nuevo Index con el mismo set de valores
+# Reordenamos usando .reindex si coinciden los valores; de lo contrario, ordenamos por string
+try:
+    grouped = grouped.loc[sorted_idx]
+except Exception:
+    grouped = grouped.sort_index()
+
+# -------------------------------
+# Cálculos DuPont (según fórmulas solicitadas)
+# -------------------------------
+with np.errstate(divide='ignore', invalid='ignore'):
+    margen = grouped["Utilidad Neta"] / grouped["Ventas Netas"]
+    rotacion = grouped["Ventas Netas"] / grouped["Activos Totales"]
+    apalancamiento = grouped["Activos Totales"] / grouped["Capital Contable"]
+    roe = margen * rotacion  # **según solicitud**
+    roa = rotacion * apalancamiento  # **según solicitud**
+
+    payback_capital = np.where(roe > 0, 1.0 / roe, np.nan)
+    payback_activos = np.where(roa > 0, 1.0 / roa, np.nan)
+    payback_capital = pd.Series(payback_capital, index=grouped.index)
+    payback_activos = pd.Series(payback_activos, index=grouped.index)
+
+# Reporte numérico base (por filas = conceptos, columnas = períodos)
+num_report = pd.DataFrame({
+    "Ventas Netas": grouped["Ventas Netas"],
+    "Utilidad Neta": grouped["Utilidad Neta"],
+    "Activos Totales": grouped["Activos Totales"],
+    "Capital Contable": grouped["Capital Contable"],
+    "Margen Neto (%)": margen * 100.0,
+    "Rotación (veces)": rotacion,
+    "Apalancamiento (veces)": apalancamiento,
+    "ROE (%)": roe * 100.0,
+    "ROA (%)": roa * 100.0,
+    "Pay Back Capital (veces)": payback_capital,
+    "Pay Back Activos (veces)": payback_activos,
+}).T
+
+# Formateo según reglas
+PCT_ROWS = ["Margen Neto (%)", "ROE (%)", "ROA (%)"]
+ABS_ROWS = ["Rotación (veces)", "Apalancamiento (veces)", "Pay Back Capital (veces)", "Pay Back Activos (veces)"]
+
+fmt_report = num_report.copy()
+for r in fmt_report.index:
+    if r in PCT_ROWS:
+        fmt_report.loc[r] = fmt_report.loc[r].apply(lambda x: "" if pd.isna(x) else f"{x:.1f}%")
+    elif r in ABS_ROWS:
+        def _fmt_abs(x):
+            if pd.isna(x):
+                return ""
+            if np.isinf(x):
+                return "∞"
+            return f"{x:.1f}"
+        fmt_report.loc[r] = fmt_report.loc[r].apply(_fmt_abs)
+    else:
+        # valores base — mostrar con separadores y 1 decimal
+        fmt_report.loc[r] = fmt_report.loc[r].apply(lambda x: "" if pd.isna(x) else f"{x:,.1f}")
+
+# -------------------------------
+# Salida — tablas y descargas
+# -------------------------------
+st.subheader("Reporte (formateado)")
+st.dataframe(fmt_report, use_container_width=True)
+
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    st.download_button(
+        "Descargar CSV (formateado)",
+        data=fmt_report.to_csv(index=True).encode("utf-8"),
+        file_name="reporte_dupont_formateado.csv",
+        mime="text/csv",
+    )
+with col_b:
+    st.download_button(
+        "Descargar CSV (numérico)",
+        data=num_report.to_csv(index=True).encode("utf-8"),
+        file_name="reporte_dupont_numerico.csv",
+        mime="text/csv",
+    )
+with col_c:
+    # Excel con dos hojas
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+        num_report.to_excel(writer, sheet_name="Numerico")
+        fmt_report.to_excel(writer, sheet_name="Formateado")
+    st.download_button(
+        "Descargar Excel (ambas hojas)",
+        data=bio.getvalue(),
+        file_name="reporte_dupont.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# -------------------------------
+# Ayuda de despliegue
+# -------------------------------
+with st.expander("Cómo desplegar en Streamlit Cloud y GitHub"):
+    st.markdown(
+        """
+1. Crea un repositorio en GitHub y sube este archivo como **app.py**. 
+2. Agrega un archivo **requirements.txt** con:
+   
+   ```
+   streamlit
+   pandas
+   numpy
+   openpyxl
+   xlsxwriter
+   ```
+3. En [share.streamlit.io](https://share.streamlit.io), conecta tu cuenta de GitHub, elige el repo y selecciona **app.py** como archivo principal.
+4. ¡Listo! Podrás compartir la URL de tu app con tu equipo.
+        """
+    )
